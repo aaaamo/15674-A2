@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Generated outputs (re-created by main.py)
+out/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Secrets
+.env
