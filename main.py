@@ -14,6 +14,10 @@ DENSIFY = [False, True]
 N_3D = 4096
 DENSIFY_3D = [True, False]
 
+N_ORBIT = 16
+ORBIT_ELEV = 25.0
+ORBIT_TILT = 20.0
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 OUT = pathlib.Path("out")
 RESULTS = OUT / "results.csv"
@@ -51,7 +55,7 @@ def test_2d():
                 start = time.perf_counter()
                 img = opt.optimize() if D else opt.optimize(N, densify=False)
                 img = img.detach().clamp(0, 1)
-                value = psnr(img, target)  # .item() waits for the GPU to finish
+                value = psnr(img, target)
                 seconds = time.perf_counter() - start
                 results[tag, name, N] = value
                 times[tag, name, N] = seconds
@@ -94,6 +98,8 @@ def test_3d():
         seconds = time.perf_counter() - start
 
         print(f"time {seconds:.1f} s")
+        run_dir = OUT / f"spheres_{tag}_{N_3D}"
+        run_dir.mkdir(exist_ok=True)
         for split, frames in [("train", camera.frames), ("val", camera.val_frames)]:
             with torch.no_grad():
                 renders = [opt.gaussians(camera, fr).clamp(0, 1) for fr in frames]
@@ -102,13 +108,28 @@ def test_3d():
             print(f"{split} PSNR {value:.2f} dB over {len(scores)} views")
             save_result(f"spheres_{split}", tag, N_3D, opt.final_N, value, seconds)
 
-            run_dir = OUT / f"spheres_{tag}_{N_3D}"
-            run_dir.mkdir(exist_ok=True)
             for i, (fr, img) in enumerate(zip(frames, renders)):
                 out = (torch.cat([fr["img"], img], dim=1) * 255).byte()
                 Image.fromarray(out.cpu().numpy()).save(
                     run_dir / f"{split}_{i:03d}.png"
                 )
+
+        poses = camera.orbit(N_ORBIT, ORBIT_ELEV, ORBIT_TILT)
+        with torch.no_grad():
+            renders = [opt.gaussians(camera, fr).clamp(0, 1) for fr in poses]
+        orbit = [Image.fromarray((r * 255).byte().cpu().numpy()) for r in renders]
+        for i, img in enumerate(orbit):
+            img.save(run_dir / f"orbit_{i:03d}.png")
+        orbit[0].save(
+            run_dir / "orbit.gif",
+            save_all=True,
+            append_images=orbit[1:],
+            duration=150,
+            loop=0,
+        )
+
+        del opt, renders
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

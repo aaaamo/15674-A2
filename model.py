@@ -26,8 +26,8 @@ def gaussian_weight(xy, mu, Sigma):
     # xymu = xy[:, None, :] - mu[None, :, :]  # (P, N, 2)
     # Sigma_inv = torch.linalg.inv(Sigma)
     # m = torch.einsum("pni,nij,pnj->pn", xymu, Sigma_inv, xymu)
-    dx = xy[:, None, 0] - mu[None, :, 0]  # (P, N)
-    dy = xy[:, None, 1] - mu[None, :, 1]  # (P, N)
+    dx = xy[:, None, 0] - mu[None, :, 0]
+    dy = xy[:, None, 1] - mu[None, :, 1]
     a, b, c = Sigma[:, 0, 0], Sigma[:, 0, 1], Sigma[:, 1, 1]
     det = (a * c - b * b).clamp(min=1e-8)
     m = ((c * dx * dx - 2 * b * dx * dy + a * dy * dy) / det).clamp(min=0)
@@ -41,11 +41,9 @@ def pixel_grid(H, W):
 
 def render(mu, Sigma, color, opacity, order, H, W, xy=None):
     # color: (N, 3),  opacity: (N,) in [0, 1],  order: indices sorted front -> back
-    # xy: optional (P, 2) subset of pixels; then the result is (P, 3), not (H, W, 3)
     whole = xy is None
     if whole:
         xy = pixel_grid(H, W).to(mu.device)  # (H*W, 2)
-    # sort the per-Gaussian inputs front to back here, instead of gathering (P, N) columns
     mu, Sigma, color, opacity = mu[order], Sigma[order], color[order], opacity[order]
     w = gaussian_weight(xy, mu, Sigma)  # (P, N)  from P1
     # alpha = opacity[None, :] * w  # (P, N)
@@ -307,6 +305,37 @@ class Camera:
     def random_frame(self):
         return self.frames[torch.randint(len(self.frames), (1,)).item()]
 
+    def orbit(self, n=16, elev=25.0, tilt=20.0):
+        device = self.K.device
+        radius = self.frames[0]["t"].norm()
+        elev, tilt = math.radians(elev), math.radians(tilt)
+        phi = torch.arange(n, device=device) * (2 * math.pi / n)
+        ring = torch.stack(
+            [
+                math.cos(elev) * phi.sin(),
+                math.sin(elev) * torch.ones_like(phi),
+                math.cos(elev) * phi.cos(),
+            ],
+            dim=-1,
+        )
+        Rx = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, math.cos(tilt), -math.sin(tilt)],
+                [0.0, math.sin(tilt), math.cos(tilt)],
+            ],
+            device=device,
+        )
+        center = radius * ring @ Rx.T
+        forward = -center / radius
+        up = torch.tensor([0.0, 1.0, 0.0], device=device).expand_as(forward)
+        right = torch.linalg.cross(forward, up)
+        right = right / right.norm(dim=-1, keepdim=True)
+        down = torch.linalg.cross(forward, right)
+        R_wc = torch.stack([right, down, forward], dim=1)
+        t = -(R_wc @ center[..., None]).squeeze(-1)
+        return [{"R_wc": R, "t": tt} for R, tt in zip(R_wc, t)]
+
 
 class Gaussian3D(nn.Module):
 
@@ -322,6 +351,9 @@ class Gaussian3D(nn.Module):
     def random(cls, N, H, W) -> Gaussian3D:
         mu3 = (torch.rand(N, 3) * 2 - 1) * 1.5  # (N, 3)  cloud in ~[-1.5, 1.5]^3
         log_s = torch.log(0.08 * torch.ones(N, 3))  # (N, 3)  small 3D blobs
+        far = N // 2
+        mu3[far:] = (torch.rand(N - far, 3) * 2 - 1) * 50.0
+        log_s[far:] = math.log(5.0)
         quat = torch.zeros(N, 4)
         quat[:, 0] = 1.0  # (N, 4)  identity rotation (w, x, y, z)
         color = torch.zeros(N, 3)  # (N, 3)  sigmoid -> gray
@@ -329,16 +361,18 @@ class Gaussian3D(nn.Module):
         return cls(mu3, log_s, quat, color, op_raw)
 
     def forward(self, camera: Camera, frame, xy=None):
-        Sigma = covariance_3d(self.log_s.exp(), self.quat)
+        x, y, z = (self.mu @ frame["R_wc"].T + frame["t"]).unbind(-1)
+        vis = (z > 0.2) & (x * x + y * y < (1.5 * z) ** 2)
+        Sigma = covariance_3d(self.log_s[vis].exp(), self.quat[vis])
         mu2, sig2, depth = project_gaussian(
-            self.mu, Sigma, frame["R_wc"], frame["t"], camera.K
+            self.mu[vis], Sigma, frame["R_wc"], frame["t"], camera.K
         )
         order = torch.argsort(depth, descending=False)
         return render(
             mu2,
             sig2,
-            self.color.sigmoid(),
-            self.op_raw.sigmoid(),
+            self.color[vis].sigmoid(),
+            self.op_raw[vis].sigmoid(),
             order,
             camera.H,
             camera.W,
@@ -349,11 +383,12 @@ class Gaussian3D(nn.Module):
 class Optimizer3D:
     densify_every = 200  # run a pass every 200 optimization steps
     # grad_threshold = 1e-4  # densify Gaussian i if g_i > grad_threshold
-    densify_frac = 0.2  # densify the top % of Gaussians by g_i each pass
-    size_threshold = 0.2  # clone if max scale <= this, else split
+    densify_frac = 0.3  # densify the top % of Gaussians by g_i each pass
+    size_threshold = 0.15  # clone if max scale <= this, else split
     split_scale = 1.6  # each split child gets (parent scale / split_scale)
     # prune_opacity = 0.005  # remove Gaussian i if its opacity < this
     prune_opacity = 0.12
+    chunk_above = 1024
 
     def __init__(self, camera: Camera, budget=256):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -381,9 +416,12 @@ class Optimizer3D:
             frame = self.camera.random_frame()
             target = frame["img"]
             opt.zero_grad()
-            img = gaussians(self.camera, frame)
-            loss = ((img - target) ** 2).mean()
-            loss.backward()
+            if gaussians.mu.size(0) <= self.chunk_above:
+                img = gaussians(self.camera, frame)
+                loss = ((img - target) ** 2).mean()
+                loss.backward()
+            else:
+                img, loss = self.backward_chunked(gaussians, frame)
             opt.step()
             grad_mag += gaussians.mu.grad.norm(dim=-1)
             # psnr = -10 * torch.log10(loss)
@@ -398,6 +436,23 @@ class Optimizer3D:
         self.final_N = gaussians.mu.size(0)
         self.gaussians = gaussians
         return img
+
+    def backward_chunked(self, gaussians: Gaussian3D, frame):
+        target = frame["img"]
+        H, W = target.size()[:2]
+        xy = pixel_grid(H, W).to(target.device)
+        target_flat = target.reshape(-1, 3)
+        P_chunk = max(H * W * self.chunk_above // gaussians.mu.size(0), 1)
+        img = torch.empty_like(target_flat)
+        loss = 0.0
+        for p in range(0, H * W, P_chunk):
+            out = gaussians(self.camera, frame, xy[p : p + P_chunk])
+            chunk_loss = ((out - target_flat[p : p + P_chunk]) ** 2).sum()
+            chunk_loss = chunk_loss / target.numel()
+            chunk_loss.backward()
+            img[p : p + P_chunk] = out.detach()
+            loss = loss + chunk_loss.detach()
+        return img.reshape(H, W, 3), loss
 
     def densify(self, gaussians: Gaussian3D, grad_mag):
         # grad_mag: per-Gaussian g_i accumulated since the last pass
